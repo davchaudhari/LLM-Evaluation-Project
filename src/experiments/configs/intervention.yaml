@@ -1,0 +1,18 @@
+# Intervention experiment configuration
+
+extends: vllm.yaml
+
+intervention:
+  type: "length_aware_microbatch"
+  microbatch_window_ms: 20
+  length_buckets:
+    short: 64
+    medium: 128
+    long: 256
+
+experiment:
+  num_requests: 32
+  mixed_lengths: true
+  short_ratio: 0.5
+  short_tokens: 32
+  long_tokens: 256

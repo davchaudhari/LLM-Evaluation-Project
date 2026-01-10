@@ -1,0 +1,14 @@
+# vLLM-specific configuration
+
+extends: base.yaml
+
+backend:
+  type: "vllm"
+  tensor_parallel_size: 1
+  max_model_len: 4096
+  gpu_memory_utilization: 0.9
+
+experiment:
+  num_requests: 16
+  batch_size: 8
+  max_tokens: 64

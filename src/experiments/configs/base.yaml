@@ -1,0 +1,18 @@
+# Base experiment configuration
+
+model:
+  model_id: "Qwen/Qwen2.5-3B-Instruct"  # Small model for T4
+  cache_dir: "/models"
+
+experiment:
+  num_requests: 16
+  batch_size: 8
+  max_tokens: 64
+  seed: 42
+
+workload:
+  prompts:
+    - "What is machine learning?"
+    - "Explain Python programming."
+    - "What is a neural network?"
+    - "Define artificial intelligence."
