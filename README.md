@@ -13,15 +13,15 @@ This repository contains a comprehensive evaluation framework for LLM serving sy
 
 ## Key Results
 
-### Intervention Experiment
-- **93.4% improvement** in short-request E2E P99 latency (18,558.7 ms → 1,224.9 ms)
-- **95.6% improvement** in short-request TTFT P99 (13,911.3 ms → 617.4 ms)
-- **+76% throughput** increase (222.4 → 391.4 tok/s)
-- Statistically validated with matched workloads (32 requests each)
+### Intervention Experiment (scheduler-layer)
+- **93.5% improvement** in short-request E2E P99 latency (524,870.1 ms → 34,206.0 ms)
+- **93.5% improvement** in short-request TTFT P99 (520,614.9 ms → 33,654.9 ms)
+- **+75.6% throughput** increase (241.3 → 423.8 tok/s)
+- Statistically validated with matched workloads (1,000 requests each: 500 short + 500 long)
 
 ### Direct Benchmark
-- **vLLM 93× faster TTFT** than HuggingFace (47.4 ms vs 4,425.1 ms)
-- **vLLM 33× higher throughput** than HuggingFace sequential (870.7 vs 26.0 tok/s)
+- **vLLM 61× lower TTFT P99** than HuggingFace (49.2 ms vs 3,006.9 ms)
+- **vLLM 29× higher throughput** than HuggingFace sequential (930.9 vs 31.9 tok/s, vLLM concurrent)
 - True streaming measurement via `AsyncLLMEngine`
 
 See [RESULTS_OUTPUT.md](RESULTS_OUTPUT.md) for detailed experimental results. This file is regenerated from the latest Modal run via `modal run modal_app.py::generate_report` (which writes `/results/report.md` on the Modal volume).
