@@ -23,21 +23,39 @@ def load_jsonl(filepath: str) -> List[Dict[str, Any]]:
 
 def _sanitize_for_json(obj):
     """Recursively sanitize data for JSON serialization.
-    
-    Converts NaN, Infinity, and -Infinity to None or strings.
+
+    Converts NaN/Infinity to None or strings, and unwraps numpy scalars
+    (bool_, integer, floating) and ndarrays into native Python types.
     """
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_sanitize_for_json(item) for item in obj]
+
+    # Handle numpy scalars and arrays without requiring numpy at import time.
+    if hasattr(obj, "item") and callable(getattr(obj, "item")) and hasattr(obj, "dtype"):
+        try:
+            return _sanitize_for_json(obj.item())
+        except (ValueError, TypeError):
+            pass
+    if hasattr(obj, "tolist") and callable(getattr(obj, "tolist")) and hasattr(obj, "dtype"):
+        try:
+            return _sanitize_for_json(obj.tolist())
+        except (ValueError, TypeError):
+            pass
+
+    if isinstance(obj, bool):
+        return obj
     if isinstance(obj, float):
         if math.isnan(obj):
             return None
-        elif math.isinf(obj):
+        if math.isinf(obj):
             return "Infinity" if obj > 0 else "-Infinity"
         return obj
-    elif isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_sanitize_for_json(item) for item in obj]
-    elif hasattr(obj, '__dict__'):
-        # Handle objects with __dict__ (like numpy scalars)
+    if isinstance(obj, (int, str)) or obj is None:
+        return obj
+
+    if hasattr(obj, "__dict__"):
         try:
             return float(obj)
         except (ValueError, TypeError):

@@ -185,6 +185,25 @@ class DirectVLLMBenchmark:
         self.engine = None
         self.async_engine = None
         self.tokenizer = None
+        self._loop = None
+
+    def _get_loop(self):
+        """Return a persistent event loop reused across all async runs.
+
+        CRITICAL: AsyncLLMEngine binds its background output-handler task to
+        the loop that first drives it. Creating (and closing) a fresh loop per
+        call orphans that task and the engine hangs forever on the next call.
+        Cache one loop on the instance and reuse it for the engine's lifetime.
+        """
+        import asyncio
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+        return self._loop
     
     def _init_engine(self):
         """Initialize vLLM engine (async for true TTFT, sync as fallback)."""
@@ -303,13 +322,10 @@ class DirectVLLMBenchmark:
                 
                 return results
             
-            # Run async function
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                results = loop.run_until_complete(run_all())
-            finally:
-                loop.close()
+            # Run async function on the persistent loop (do NOT close it: the
+            # engine's background tasks must survive for later concurrent runs)
+            loop = self._get_loop()
+            results = loop.run_until_complete(run_all())
             
             return summarize_results(results)
         else:
@@ -449,13 +465,10 @@ class DirectVLLMBenchmark:
                 
                 return list(results)
             
-            # Run async function
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                results = loop.run_until_complete(run_all())
-            finally:
-                loop.close()
+            # Reuse the persistent loop so the engine's background tasks
+            # (started during run_sequential) remain alive and keep pumping.
+            loop = self._get_loop()
+            results = loop.run_until_complete(run_all())
             
             return summarize_results(results)
         else:

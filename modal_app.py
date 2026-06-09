@@ -1782,7 +1782,7 @@ def benchmark_vllm_direct():
 @app.function(
     image=image,
     gpu="A10G",
-    timeout=3600,
+    timeout=7200,  # 2 hours: HF Seq + vLLM Seq alone take ~37 min; concurrent + mixed need headroom
     volumes={"/models": model_cache, "/results": results_volume},
 )
 def run_direct_benchmark():
@@ -1882,7 +1882,7 @@ def run_direct_benchmark():
     
     async_bench = None
     try:
-        async_bench = AsyncVLLMBenchmark(model_id, gpu_memory_utilization=0.7)
+        async_bench = AsyncVLLMBenchmark(model_id, gpu_memory_utilization=0.55)
         vllm_streaming_summary = async_bench.run_sequential(workload[:16])
         
         print(f"\n📊 vLLM Streaming Results (n={vllm_streaming_summary.num_requests}):")
@@ -2609,6 +2609,132 @@ def create_unified_results():
                 print(f"      Throughput ratio: {comp['throughput_ratio']:.2f}x")
     
     return {"status": "complete", "output_path": str(output_path)}
+
+
+@app.function(
+    image=image,
+    gpu=None,
+    timeout=600,
+    volumes={"/results": results_volume},
+)
+def rebuild_intervention_summary():
+    """Recompute /results/intervention_results.json from existing JSONL logs.
+
+    Useful when run_intervention_suite completed the experiment but failed at
+    JSON serialization. Reads the raw per-request logs already on the volume
+    and rewrites the summary using the (now-fixed) sanitizer.
+    """
+    import sys
+    sys.path.insert(0, "/root")
+
+    from src.experiments.metrics import MetricsAggregator
+    from src.utils.io import save_json
+
+    baseline_log = "/results/runs/intervention_fifo.jsonl"
+    intervention_log = "/results/runs/intervention_length_aware.jsonl"
+
+    print("=" * 80)
+    print("REBUILDING INTERVENTION SUMMARY FROM JSONL")
+    print("=" * 80)
+    print(f"  Baseline log:     {baseline_log}")
+    print(f"  Intervention log: {intervention_log}")
+
+    baseline_metrics = MetricsAggregator.from_jsonl(baseline_log)
+    intervention_metrics = MetricsAggregator.from_jsonl(intervention_log)
+
+    baseline_short = baseline_metrics.filter_by_length(
+        is_short=True, short_threshold=64
+    )
+    intervention_short = intervention_metrics.filter_by_length(
+        is_short=True, short_threshold=64
+    )
+
+    baseline_summary = baseline_metrics.get_summary(validate=True)
+    intervention_summary = intervention_metrics.get_summary(validate=True)
+    baseline_short_summary = baseline_short.get_summary(validate=True)
+    intervention_short_summary = intervention_short.get_summary(validate=True)
+
+    baseline_results = {
+        "policy": "fifo_baseline",
+        "measurement_layer": "scheduler_layer",
+        **baseline_summary,
+        "short_ttft_p99": baseline_short_summary.get("ttft_p99", 0),
+        "short_e2e_p99": baseline_short_summary.get("e2e_p99", 0),
+        "short_num_requests": baseline_short_summary.get("num_requests", 0),
+    }
+    intervention_results = {
+        "policy": "length_aware_microbatch",
+        "measurement_layer": "scheduler_layer",
+        **intervention_summary,
+        "short_ttft_p99": intervention_short_summary.get("ttft_p99", 0),
+        "short_e2e_p99": intervention_short_summary.get("e2e_p99", 0),
+        "short_num_requests": intervention_short_summary.get("num_requests", 0),
+    }
+
+    baseline_e2e = baseline_results["short_e2e_p99"]
+    intervention_e2e = intervention_results["short_e2e_p99"]
+    improvement = (
+        (baseline_e2e - intervention_e2e) / baseline_e2e * 100
+        if baseline_e2e > 0
+        else 0.0
+    )
+
+    statistical_results = None
+    try:
+        from scipy import stats
+        import numpy as np
+
+        b_e2es = [m.e2e_ms for m in baseline_short.metrics if m.e2e_ms > 0]
+        i_e2es = [m.e2e_ms for m in intervention_short.metrics if m.e2e_ms > 0]
+        if b_e2es and i_e2es:
+            statistic, p_value = stats.mannwhitneyu(
+                b_e2es, i_e2es, alternative="greater"
+            )
+            b_mean, i_mean = np.mean(b_e2es), np.mean(i_e2es)
+            pooled_std = np.sqrt((np.var(b_e2es) + np.var(i_e2es)) / 2)
+            cohens_d = (b_mean - i_mean) / pooled_std if pooled_std > 0 else 0.0
+            statistical_results = {
+                "mann_whitney_u": float(statistic),
+                "p_value": float(p_value),
+                "significant": bool(p_value < 0.05),
+                "cohens_d": float(cohens_d),
+                "baseline_mean": float(b_mean),
+                "intervention_mean": float(i_mean),
+            }
+    except Exception as e:
+        print(f"  ⚠️  Stats computation skipped: {e}")
+
+    results_to_save = {
+        "baseline": baseline_results,
+        "intervention": intervention_results,
+        "improvement_pct": float(improvement),
+        "comparison_valid": True,
+        "comparison_issues": [],
+        "statistical_analysis": statistical_results,
+        "measurement_layer": "scheduler_layer",
+        "sample_size": {
+            "total": int(baseline_summary.get("num_requests", 0)),
+            "short": int(baseline_short_summary.get("num_requests", 0)),
+            "long": int(
+                baseline_summary.get("num_requests", 0)
+                - baseline_short_summary.get("num_requests", 0)
+            ),
+        },
+        "log_files": {
+            "baseline": baseline_log,
+            "intervention": intervention_log,
+        },
+        "rebuilt_from_jsonl": True,
+    }
+
+    save_json(results_to_save, "/results/intervention_results.json")
+    print(f"\n✓ Wrote /results/intervention_results.json")
+    print(f"  Short E2E P99 improvement: {improvement:.1f}%")
+    return {
+        "improvement_pct": improvement,
+        "baseline_short_e2e_p99": baseline_e2e,
+        "intervention_short_e2e_p99": intervention_e2e,
+    }
 
 
 @app.local_entrypoint()

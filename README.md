@@ -24,7 +24,7 @@ This repository contains a comprehensive evaluation framework for LLM serving sy
 - **vLLM 33× higher throughput** than HuggingFace sequential (870.7 vs 26.0 tok/s)
 - True streaming measurement via `AsyncLLMEngine`
 
-See [RESULTS_OUTPUT.md](RESULTS_OUTPUT.md) and [REVIEW_AND_RESULTS.md](REVIEW_AND_RESULTS.md) for detailed results and methodology review.
+See [RESULTS_OUTPUT.md](RESULTS_OUTPUT.md) for detailed experimental results. This file is regenerated from the latest Modal run via `modal run modal_app.py::generate_report` (which writes `/results/report.md` on the Modal volume).
 
 ## Quick Start
 
@@ -108,9 +108,7 @@ modal-serving-alpha/
 │   ├── experiments/          # Experiment runner, metrics, workloads
 │   ├── serving/              # Scheduler and dispatch policies
 │   └── utils/                # I/O, timing, validation utilities
-├── RESULTS_OUTPUT.md         # Detailed experimental results
-├── REVIEW_AND_RESULTS.md     # Code review and merge assessment
-└── audit_report.md           # Comprehensive audit report
+└── RESULTS_OUTPUT.md         # Detailed experimental results (generated)
 ```
 
 ## License

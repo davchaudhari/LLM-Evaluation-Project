@@ -31,6 +31,7 @@ class AsyncVLLMBenchmark:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.engine = None
         self.tokenizer = None
+        self._loop = None
     
     async def _init_engine(self):
         """Initialize async vLLM engine."""
@@ -187,13 +188,22 @@ class AsyncVLLMBenchmark:
         return summarize_results(list(results))
     
     def _get_or_create_loop(self):
-        """Get existing event loop or create new one."""
+        """Get a persistent event loop, reused across all sync wrappers.
+
+        CRITICAL: AsyncLLMEngine starts background tasks (output handler) bound
+        to the loop that first runs it. Creating a fresh loop for each call
+        (e.g. run_sequential then run_concurrent) orphans those tasks and the
+        engine hangs forever. We therefore cache a single loop on the instance
+        and reuse it for the engine's entire lifetime.
+        """
         try:
-            loop = asyncio.get_running_loop()
+            return asyncio.get_running_loop()
         except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop
+            pass
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+        return self._loop
     
     def run_sequential(self, requests: List[BenchmarkRequest]) -> BenchmarkSummary:
         """Sync wrapper for sequential runs."""

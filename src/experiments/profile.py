@@ -27,28 +27,43 @@ class Profiler:
                 with_stack=True,
             ) as prof:
                 yield prof
-                
-                # Extract key metrics
-                events = prof.profiler.kineto_results.events()
-                
-                # Summarize
-                summary = {
-                    "name": name,
-                    "cuda_time_ms": 0.0,
-                    "cpu_time_ms": 0.0,
-                    "memory_allocated_mb": 0.0,
-                }
-                
-                for event in events:
-                    if hasattr(event, "cuda_time"):
-                        summary["cuda_time_ms"] += event.cuda_time / 1000.0
-                    if hasattr(event, "cpu_time"):
-                        summary["cpu_time_ms"] += event.cpu_time / 1000.0
-                
-                if torch.cuda.is_available():
-                    summary["memory_allocated_mb"] = torch.cuda.max_memory_allocated() / 1024**2
-                
-                self.profiles.append(summary)
+
+            # Events are only finalized after the profiler context exits;
+            # extracting them inside the `with` block returns empty data on
+            # modern torch.profiler. key_averages() is the stable public API.
+            try:
+                events = prof.key_averages()
+            except Exception:
+                events = []
+
+            summary = {
+                "name": name,
+                "cuda_time_ms": 0.0,
+                "cpu_time_ms": 0.0,
+                "memory_allocated_mb": 0.0,
+            }
+
+            for event in events:
+                cuda_us = (
+                    getattr(event, "self_device_time_total", None)
+                    or getattr(event, "self_cuda_time_total", None)
+                    or getattr(event, "cuda_time_total", None)
+                    or getattr(event, "cuda_time", 0)
+                    or 0
+                )
+                cpu_us = (
+                    getattr(event, "self_cpu_time_total", None)
+                    or getattr(event, "cpu_time_total", None)
+                    or getattr(event, "cpu_time", 0)
+                    or 0
+                )
+                summary["cuda_time_ms"] += float(cuda_us) / 1000.0
+                summary["cpu_time_ms"] += float(cpu_us) / 1000.0
+
+            if torch.cuda.is_available():
+                summary["memory_allocated_mb"] = torch.cuda.max_memory_allocated() / 1024**2
+
+            self.profiles.append(summary)
         else:
             # Fallback: just time it
             import time
