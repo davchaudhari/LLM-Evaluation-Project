@@ -1,30 +1,32 @@
 # LLM-Evaluation-Project
 
-Production-grade LLM serving systems evaluation framework comparing HuggingFace and vLLM with rigorous benchmarking, statistical validation, and scheduling interventions.
+An LLM serving evaluation framework, built from scratch on Modal, that benchmarks HuggingFace Transformers against vLLM and provides a pluggable scheduler for experimenting with dispatch policies. The focus of this project is the engineering: a reproducible measurement harness with two distinct measurement layers, fail-loudly validation, and built-in statistical testing.
 
-## Overview
+## What this project builds
 
-This repository contains a comprehensive evaluation framework for LLM serving systems, featuring:
+- **Two pluggable backends** behind a common interface: HuggingFace Transformers (sequential generation) and vLLM (continuous batching via `AsyncLLMEngine`), so they can be driven by identical workloads and metrics.
+- **A request scheduler with swappable dispatch policies** (`fill_batch`, `periodic`, `max_wait`, `short_first`) plus a length-aware microbatch policy, allowing controlled scheduling experiments against a FIFO baseline.
+- **Two measurement layers**: a `direct_backend` path that bypasses the scheduler for true per-request streaming TTFT, and a `scheduler_layer` path that measures end-to-end system behavior.
+- **A fail-loudly validation harness**: request-count matching, comparability checks that refuse invalid comparisons, and timing-order validation (`arrival ≤ first_token ≤ end`).
+- **Built-in statistical testing**: Mann-Whitney U, Cohen's d effect size, and matched-workload comparisons, so results come with significance rather than raw deltas.
+- **Reproducible orchestration on Modal**: every experiment is a Modal function writing versioned artifacts to a shared volume, with a report generator that builds the results doc directly from saved data (no hand-entered numbers).
 
-- **Direct Backend Benchmarks**: True streaming TTFT measurement via `AsyncLLMEngine`
-- **Scheduler-Layer Experiments**: Length-aware microbatch scheduling interventions
-- **Statistical Validation**: Mann-Whitney U tests, effect size analysis, and confidence intervals
-- **Fail-Loudly Design**: Request count validation and comparability checks
+## Measured results
 
-## Key Results
+These come straight from the saved run artifacts; the report is regenerated from them via `generate_report`.
 
-### Intervention Experiment (scheduler-layer)
-- **93.5% improvement** in short-request E2E P99 latency (524,870.1 ms → 34,206.0 ms)
-- **93.5% improvement** in short-request TTFT P99 (520,614.9 ms → 33,654.9 ms)
-- **+75.6% throughput** increase (241.3 → 423.8 tok/s)
-- Statistically validated with matched workloads (1,000 requests each: 500 short + 500 long)
+**Backend comparison (direct, scheduler bypassed).** Quantifies the gap between naive sequential generation and continuous batching:
 
-### Direct Benchmark
-- **vLLM 61× lower TTFT P99** than HuggingFace (49.2 ms vs 3,006.9 ms)
-- **vLLM 29× higher throughput** than HuggingFace sequential (930.9 vs 31.9 tok/s, vLLM concurrent)
-- True streaming measurement via `AsyncLLMEngine`
+- vLLM concurrent throughput **930.9 tok/s** vs HuggingFace sequential **31.9 tok/s** (~29×).
+- vLLM true streaming TTFT P99 **49.2 ms** vs HuggingFace **3,006.9 ms** (HuggingFace is non-streaming, so its TTFT equals its E2E latency).
+- vLLM concurrent E2E P99 **1,098.9 ms**; matched generation settings and seed across both backends.
 
-See [RESULTS_OUTPUT.md](RESULTS_OUTPUT.md) for detailed experimental results. This file is regenerated from the latest Modal run via `modal run modal_app.py::generate_report` (which writes `/results/report.md` on the Modal volume).
+**Scheduling experiment (length-aware vs FIFO, open-loop Poisson ~1.2 req/s).** A controlled test run through the same harness:
+
+- Short-request E2E P99 8,842.7 ms → 8,123.0 ms (8.1% lower); throughput 139.4 → 142.4 tok/s.
+- Mann-Whitney U p = 0.24, Cohen's d = 0.09 — no statistically significant difference at this load. Reported as-is; see Limitations for the load regimes not yet swept.
+
+See [RESULTS_OUTPUT.md](RESULTS_OUTPUT.md) for the full report. It is regenerated from the latest Modal run via `modal run modal_app.py::generate_report` (which writes `/results/report.md` on the Modal volume).
 
 ## Quick Start
 
@@ -47,7 +49,9 @@ modal run modal_app.py::run_direct_benchmark
 modal run modal_app.py::profile_vllm
 ```
 
-### Generate Plots and Report
+### Generate Report
+
+`generate_report` reads the saved JSON summaries and writes `/results/report.md`. (Plots are produced separately by `run_hf_suite` and `run_vllm_suite` into `/results/figures/`.)
 
 ```bash
 modal run modal_app.py::generate_report
@@ -61,7 +65,7 @@ modal run modal_app.py::show_results_summary
 
 ## Experiment Suite
 
-1. **Direct Benchmark**: True backend performance with streaming TTFT measurement
+1. **Direct Benchmark**: Backend performance with streaming TTFT measurement (vLLM)
 2. **Intervention Suite**: Length-aware scheduling vs FIFO baseline
 3. **TTFT Stair-Step**: N=16, batch=8, shows queueing effect
 4. **Dispatch Policies**: fill_batch, periodic, max_wait, short_first
@@ -73,8 +77,8 @@ modal run modal_app.py::show_results_summary
 
 All results saved to Modal volume `/results/`:
 - `results/runs/`: JSONL logs per experiment
-- `results/profiles/`: Profiler traces
-- `results/figures/`: Plots
+- `results/profiles/`: vLLM profiler output (CPU-time summary; CUDA/memory not captured because vLLM runs in a separate worker process)
+- `results/figures/`: Plots (PNG, generated by the HF/vLLM suites)
 - `results/direct_benchmark/`: Direct benchmark results
 - `results/intervention_results.json`: Intervention experiment summary
 
@@ -90,6 +94,13 @@ All results saved to Modal volume `/results/`:
 - Timing order validation (arrival ≤ first_token ≤ end)
 - Statistical significance testing (Mann-Whitney U, effect size)
 
+## Limitations
+
+- The scheduling experiment was run at a single moderate load point (~1.2 req/s, ~60% utilization); a load sweep toward saturation, where length-aware scheduling is expected to matter more, has not been run.
+- Workloads are synthetic (seeded length distributions), not captured production traces.
+- Profiling captures only the host/orchestration process; vLLM runs the model in a separate worker, so device-side CUDA time and memory are not captured by the in-process `torch.profiler`.
+- HuggingFace TTFT is measured non-streaming (TTFT equals E2E latency), so backend TTFT comparisons are not strictly apples-to-apples.
+
 ## Requirements
 
 - Modal account
@@ -100,7 +111,7 @@ All results saved to Modal volume `/results/`:
 ## Structure
 
 ```
-modal-serving-alpha/
+LLM-Evaluation-Project/
 ├── modal_app.py              # Main Modal app with experiment functions
 ├── src/
 │   ├── backends/             # HuggingFace and vLLM backend implementations

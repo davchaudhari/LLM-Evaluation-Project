@@ -80,14 +80,22 @@ class WorkloadGenerator:
         short_ratio: float = 0.5,
         short_tokens: int = 32,
         long_tokens: int = 256,
-        base_time: float = 0.0
+        base_time: float = 0.0,
+        lambda_rate: Optional[float] = None,
     ) -> List[WorkloadRequest]:
         """Generate mixed-length workload.
-        
+
         For short_ratio=0.5, alternates between short and long to ensure exact ratio.
         For other ratios, uses random sampling.
+
+        If ``lambda_rate`` (requests/sec) is given, requests are assigned
+        Poisson (exponential inter-arrival) arrival times instead of all
+        arriving at once. This produces a realistic load profile so that
+        queueing/head-of-line effects reflect genuine contention rather than a
+        single synchronized burst.
         """
         requests = []
+        cumulative_time = 0.0
         for i in range(num_requests):
             if short_ratio == 0.5:
                 # Exact 50/50 split by alternating
@@ -96,11 +104,15 @@ class WorkloadGenerator:
                 # Random sampling for other ratios
                 is_short = random.random() < short_ratio
             max_tokens = short_tokens if is_short else long_tokens
-            
+
+            if lambda_rate is not None and i > 0:
+                cumulative_time += random.expovariate(lambda_rate)
+            arrival = base_time + (cumulative_time if lambda_rate is not None else 0.0)
+
             requests.append(WorkloadRequest(
                 request_id=f"req_{i:04d}",
                 prompt=self.prompts[i % len(self.prompts)],
                 max_new_tokens=max_tokens,
-                arrival_time=base_time,
+                arrival_time=arrival,
             ))
         return requests

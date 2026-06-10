@@ -48,7 +48,8 @@ class ExperimentRunner:
         self,
         workload: List[WorkloadRequest],
         policy_name: str = "unknown",
-        use_streaming_ttft: bool = False
+        use_streaming_ttft: bool = False,
+        respect_arrival_times: bool = False,
     ) -> MetricsAggregator:
         """Run a workload and collect metrics.
         
@@ -57,6 +58,13 @@ class ExperimentRunner:
         
         BUG FIX: Loop now checks policy.has_pending() to handle policies
         that buffer requests internally (e.g., LengthAwareMicrobatchPolicy).
+
+        ARRIVAL GATING: When ``respect_arrival_times`` is True, a request only
+        becomes visible to the dispatch policy once wall-clock time reaches its
+        absolute arrival time. This makes Poisson/open-loop workloads behave
+        like real load (requests trickle in) instead of a synchronized burst
+        where every request is queued at t=0. Default False preserves the
+        original burst behavior for existing experiments.
         """
         self.metrics = MetricsAggregator(measurement_layer="scheduler_layer")
         
@@ -83,14 +91,28 @@ class ExperimentRunner:
         # Batch processing mode
         pending = deque()
         active_requests = {}
-        
-        # Submit all requests
-        for req in workload:
-            pending.append(req)
+
+        # Requests not yet "arrived" (only used when respect_arrival_times=True),
+        # sorted ascending by absolute arrival time for O(1) front admission.
+        if respect_arrival_times:
+            not_arrived = deque(
+                sorted(workload, key=lambda r: arrival_times[r.request_id])
+            )
+        else:
+            not_arrived = deque()
+            # Burst mode: submit all requests immediately
+            for req in workload:
+                pending.append(req)
         
         # Process requests
         # BUG FIX: Added self.policy.has_pending() to handle policies with internal buffers
-        while pending or active_requests or self.policy.has_pending():
+        while pending or active_requests or self.policy.has_pending() or not_arrived:
+            # Admit any requests whose arrival time has now passed.
+            if not_arrived:
+                now = get_timestamp()
+                while not_arrived and arrival_times[not_arrived[0].request_id] <= now:
+                    pending.append(not_arrived.popleft())
+
             # Check dispatch policy
             if self.policy.should_dispatch(
                 pending,
@@ -110,8 +132,10 @@ class ExperimentRunner:
                     active_requests[req.request_id] = req
             
             if not active_requests:
-                # BUG FIX: Also check policy.has_pending() before breaking
-                if not pending and not self.policy.has_pending():
+                # BUG FIX: Also check policy.has_pending() before breaking.
+                # With arrival gating, also wait while requests are still
+                # scheduled to arrive in the future.
+                if not pending and not self.policy.has_pending() and not not_arrived:
                     break
                 time.sleep(0.001)
                 continue

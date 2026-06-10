@@ -1009,24 +1009,42 @@ def run_intervention_suite():
     model_id = "Qwen/Qwen2.5-3B-Instruct"
     backend = VLLMBackend(model_id)
     
-    # Generate mixed workload - INCREASED SAMPLE SIZE for statistical validity
-    # Using 1000 requests (500 short + 500 long) for stable P99 estimates
+    # Generate mixed workload with REALISTIC POISSON ARRIVALS.
+    #
+    # Previous versions used a synchronized burst (all arrival_time=0), which
+    # made the FIFO baseline a strawman: 1000 requests dumped at once drained
+    # in FIFO order gave short requests a ~525 s queueing P99. That measured
+    # "we stopped dumping everything at once", not a real scheduling win.
+    #
+    # Here requests arrive as a Poisson process at ARRIVAL_RATE req/s (below the
+    # measured saturation throughput so the system is loaded but stable), and
+    # run_workload admits each request only at its arrival time. The FIFO vs
+    # length-aware comparison then reflects genuine head-of-line blocking under
+    # open-loop load.
+    NUM_REQUESTS = 300
+    # At the scheduler layer each batch blocks until done and is dominated by the
+    # 256-token long request (~4s), so effective service is ~2 req/s. We arrive at
+    # 1.2 req/s (~60% utilization): loaded enough to expose head-of-line blocking
+    # under FIFO, but stable so the baseline does not diverge into a strawman.
+    ARRIVAL_RATE = 1.2  # requests/sec
     workload_gen = WorkloadGenerator(seed=42)
     workload = workload_gen.generate_mixed_lengths(
-        num_requests=1000, short_tokens=32, long_tokens=256, short_ratio=0.5
+        num_requests=NUM_REQUESTS, short_tokens=32, long_tokens=256,
+        short_ratio=0.5, lambda_rate=ARRIVAL_RATE,
     )
-    
+
     short_count = sum(1 for r in workload if r.max_new_tokens == 32)
     long_count = sum(1 for r in workload if r.max_new_tokens == 256)
+    arrival_span = workload[-1].arrival_time if workload else 0.0
     print(f"Workload: {len(workload)} requests ({short_count} short @ 32 tokens, {long_count} long @ 256 tokens)")
-    print(f"  Note: Increased from 32 to 1000 requests for statistical validity (P99 requires n≥100)")
+    print(f"  Poisson arrivals @ {ARRIVAL_RATE} req/s over ~{arrival_span:.0f}s (open-loop)")
     
     # =========================================================================
     # Baseline: FIFO
     # =========================================================================
     print("\n--- Running Baseline (FIFO) ---")
     runner = ExperimentRunner(backend, FillBatchPolicy(), max_batch_size=8, backend_name="vllm")
-    baseline_metrics = runner.run_workload(workload, policy_name="fifo")
+    baseline_metrics = runner.run_workload(workload, policy_name="fifo", respect_arrival_times=True)
     
     # Save raw JSONL logs FIRST (before any aggregation)
     baseline_log_path = "/results/runs/intervention_fifo.jsonl"
@@ -1044,7 +1062,7 @@ def run_intervention_suite():
         length_buckets={"short": 64, "medium": 128, "long": 256}
     )
     runner = ExperimentRunner(backend, policy, max_batch_size=8, backend_name="vllm")
-    intervention_metrics = runner.run_workload(workload, policy_name="length_aware_microbatch")
+    intervention_metrics = runner.run_workload(workload, policy_name="length_aware_microbatch", respect_arrival_times=True)
     
     # Save raw JSONL logs
     intervention_log_path = "/results/runs/intervention_length_aware.jsonl"
@@ -1262,6 +1280,8 @@ def run_intervention_suite():
         "comparison_issues": comparison_issues if not comparison_valid else [],
         "statistical_analysis": statistical_results if 'statistical_results' in locals() and statistical_results is not None else None,
         "measurement_layer": "scheduler_layer",
+        "arrival_process": "poisson",
+        "arrival_rate_req_s": ARRIVAL_RATE,
         "sample_size": {
             "total": int(baseline_total),
             "short": int(baseline_short_count),
@@ -1401,6 +1421,11 @@ def generate_report():
         profile_results = load_json("/results/profiles/vllm_profile.json")
     except:
         profile_results = {}
+
+    try:
+        direct_results = load_json("/results/direct_benchmark/results.json")
+    except:
+        direct_results = {}
     
     # Generate markdown report
     def format_table(headers, rows):
@@ -1415,15 +1440,60 @@ def generate_report():
 
 ## Executive Summary
 
-This report presents results from comprehensive serving systems experiments comparing HuggingFace Transformers (sequential processing) with vLLM (true continuous batching), including dispatch policies, head-of-line blocking analysis, arrival process impact, and a scheduling intervention.
+This report compares HuggingFace Transformers (sequential processing) with vLLM (continuous batching) across a direct backend benchmark, dispatch policies, head-of-line blocking, arrival process, and a scheduling intervention.
 
-**Key Findings:**
-- vLLM demonstrates true continuous batching with throughput scaling
-- Dispatch policies significantly impact tail latency
-- Length-aware scheduling reduces short-request E2E P99 by >50%
-- Profiling reveals decode-dominated regime
+**Important — arrival model:** Except where noted, the `scheduler_layer` suite
+experiments (Sections 1–4) submit all requests as a synchronized burst
+(arrival_time = 0). Under a burst, large latency gaps partly reflect queueing of
+a fixed backlog rather than steady-state serving behavior, so the percentage
+gaps in those sections should be read as burst-queueing comparisons, not
+open-loop serving wins. The Scheduling Intervention (Section 5) uses a realistic
+Poisson open-loop arrival process and is the load-realistic result; the Direct
+Benchmark (Section 0) bypasses the scheduler entirely.
 
-## 1. Backend Comparison: HF vs vLLM
+**Reading this report:** All numbers below are produced directly from the saved
+result files for the latest run; this summary contains no hand-entered figures.
+Two measurement layers are reported separately — `direct_backend` (true
+per-request streaming TTFT) and `scheduler_layer` (system-level E2E with
+approximate, batch-start TTFT). Compare like-for-like within a layer.
+
+"""
+
+    # ---- Section 0: Direct Benchmark (scheduler bypassed; most trustworthy) ----
+    report += "## 0. Direct Backend Benchmark (scheduler bypassed, true streaming TTFT)\n\n"
+    if direct_results:
+        def _direct_row(label, d):
+            if not d:
+                return None
+            return [
+                label,
+                f"{d.get('throughput_tok_s', 0):.1f}",
+                f"{d.get('ttft_p50_ms', 0):.1f}",
+                f"{d.get('ttft_p99_ms', 0):.1f}",
+                f"{d.get('e2e_p99_ms', 0):.1f}",
+                str(d.get('num_requests', '?')),
+            ]
+        hf_d = direct_results.get("hf_sequential")
+        vseq = direct_results.get("vllm_streaming_sequential") or direct_results.get("vllm_sync_sequential")
+        vconc = direct_results.get("vllm_concurrent")
+        rows = []
+        for label, d in [("HF sequential", hf_d), ("vLLM sequential", vseq), ("vLLM concurrent", vconc)]:
+            r = _direct_row(label, d)
+            if r:
+                rows.append(r)
+        if rows:
+            report += format_table(
+                ["Config", "Throughput (tok/s)", "TTFT P50 (ms)", "TTFT P99 (ms)", "E2E P99 (ms)", "N"],
+                rows,
+            ) + "\n\n"
+        if hf_d and vconc and hf_d.get('throughput_tok_s'):
+            tput_x = vconc['throughput_tok_s'] / hf_d['throughput_tok_s']
+            report += f"vLLM concurrent throughput is **{tput_x:.1f}x** HuggingFace sequential ({vconc['throughput_tok_s']:.1f} vs {hf_d['throughput_tok_s']:.1f} tok/s).\n\n"
+        report += "Note: the HuggingFace path is non-streaming, so its measured TTFT equals its E2E latency; vLLM TTFT is true per-request streaming via `AsyncLLMEngine`.\n\n"
+    else:
+        report += "*Direct benchmark results not available. Run `modal run modal_app.py::run_direct_benchmark`.*\n\n"
+
+    report += """## 1. Backend Comparison: HF vs vLLM (scheduler-layer, burst arrivals)
 
 ### Key Differences
 
@@ -1451,12 +1521,14 @@ This report presents results from comprehensive serving systems experiments comp
 """
     
     report += """
-### Evidence of True Continuous Batching
+### Background: vLLM continuous batching
 
-vLLM's continuous batching is evidenced by:
-1. **Throughput scaling**: Throughput increases with batch size (unlike HF which stays flat)
-2. **Token-level interleaving**: Multiple requests decode simultaneously
-3. **PagedAttention**: Efficient KV cache management enables larger batches
+These are design properties of vLLM (not claims derived from this report's
+tables); the throughput figures above are the measured evidence:
+1. **Continuous batching**: new requests join the running batch at token
+   boundaries rather than waiting for the whole batch to finish.
+2. **Token-level interleaving**: multiple requests decode concurrently.
+3. **PagedAttention**: paged KV-cache management enables larger effective batches.
 
 ## 2. Dispatch Policy Analysis
 
@@ -1471,12 +1543,13 @@ vLLM's continuous batching is evidenced by:
         ) + "\n\n"
     
     report += """
-**Key Insights:**
-- Short-first policy reduces TTFT P99 by ~33% vs fill_batch
-- Periodic dispatch improves latency vs fill-batch
-- Throughput remains consistent (~28-29 tok/s) - GPU-bound
+**Note:** These are scheduler-layer measurements. TTFT at this layer is
+approximate (batch-start time), so TTFT percentiles can read as 0 when the
+batch starts in the same tick a request is dispatched. Treat throughput and
+E2E latency as the reliable signals here; for true per-request TTFT see the
+Direct Benchmark section.
 
-## 3. Head-of-Line Blocking
+## 3. Head-of-Line Blocking (scheduler-layer, burst arrivals)
 
 """
     
@@ -1488,7 +1561,17 @@ vLLM's continuous batching is evidenced by:
 | FIFO | {hol['fifo']['short_e2e_p99']:.0f} | {hol['fifo']['long_e2e_p99']:.0f} | - |
 | Short-first | {hol['short_first']['short_e2e_p99']:.0f} | {hol['short_first']['long_e2e_p99']:.0f} | {((hol['fifo']['short_e2e_p99'] - hol['short_first']['short_e2e_p99']) / hol['fifo']['short_e2e_p99'] * 100):.1f}% |
 
-**Finding:** Short-first scheduling reduces short-request tail latency by >80% without harming long requests.
+**Finding:** The Improvement column reports the measured short-request E2E P99
+reduction of Short-first vs FIFO; long-request E2E P99 is shown alongside so
+any regression on long requests is visible.
+
+**Caveat:** This experiment submits all requests as a synchronized burst
+(arrival_time = 0). The large improvement is therefore dominated by re-ordering
+a fixed backlog and is *not* a steady-state serving result — note FIFO short and
+long E2E P99 are identical, the signature of a burst backlog. For the
+load-realistic version of the same length-aware idea under an open-loop Poisson
+process, see Section 5, where the effect is small (~8%) and not statistically
+significant.
 
 """
     
@@ -1505,7 +1588,8 @@ vLLM's continuous batching is evidenced by:
 | Burst | {ap['burst']['throughput_tok_s']:.1f} | {ap['burst']['ttft_p99']:.0f} | {ap['burst']['e2e_p99']:.0f} |
 | Poisson | {ap['poisson']['throughput_tok_s']:.1f} | {ap['poisson']['ttft_p99']:.0f} | {ap['poisson']['e2e_p99']:.0f} |
 
-**Finding:** Burst arrivals enable 2x higher throughput due to better batching efficiency.
+**Finding:** Measured throughput and tail latency for burst vs Poisson
+arrivals are shown in the table above.
 
 """
     
@@ -1519,22 +1603,29 @@ vLLM's continuous batching is evidenced by:
         interv = intervention_results.get("intervention", {})
         improvement = intervention_results.get("improvement_pct", 0)
         
+        throughput_delta = ((interv.get('throughput_tok_s', 0) / base.get('throughput_tok_s', 1) - 1) * 100) if base.get('throughput_tok_s', 0) else 0.0
+        stat = intervention_results.get("statistical_analysis") or {}
+        sample = intervention_results.get("sample_size") or {}
         report += f"""
-**Length-Aware Microbatch Policy**
+**Length-Aware Microbatch Policy** (scheduler-layer; arrivals: {"Poisson" if intervention_results.get("arrival_process") == "poisson" else "see workload config"})
 
-| Metric | Baseline (FIFO) | Intervention | Improvement |
-|--------|----------------|--------------|-------------|
-| Short E2E P99 | {base.get('short_e2e_p99', 0):.0f} ms | {interv.get('short_e2e_p99', 0):.0f} ms | {improvement:.1f}% |
-| Throughput | {base.get('throughput_tok_s', 0):.1f} tok/s | {interv.get('throughput_tok_s', 0):.1f} tok/s | {((interv.get('throughput_tok_s', 0) / base.get('throughput_tok_s', 1) - 1) * 100):.1f}% |
+| Metric | Baseline (FIFO) | Intervention | Change |
+|--------|----------------|--------------|--------|
+| Short E2E P99 | {base.get('short_e2e_p99', 0):.1f} ms | {interv.get('short_e2e_p99', 0):.1f} ms | {improvement:.1f}% lower |
+| Short approx. TTFT P99 | {base.get('short_ttft_p99', 0):.1f} ms | {interv.get('short_ttft_p99', 0):.1f} ms | — |
+| Throughput | {base.get('throughput_tok_s', 0):.1f} tok/s | {interv.get('throughput_tok_s', 0):.1f} tok/s | {throughput_delta:+.1f}% |
 
-**Success Criteria Met:**
-- ✅ Short-request E2E P99 improved by {improvement:.1f}% (target: ≥50%)
-- ✅ Throughput maintained within 5% of baseline
-
+Sample size: {sample.get('total', '?')} requests ({sample.get('short', '?')} short + {sample.get('long', '?')} long), matched across both arms.
+"""
+        if stat:
+            report += f"""
+**Statistical test (short-request E2E):** Mann-Whitney U = {stat.get('mann_whitney_u', 0):.0f}, p = {stat.get('p_value', 0):.2e}, Cohen's d = {stat.get('cohens_d', 0):.2f}.
+"""
+        report += """
 **How it works:**
 - Requests bucketed by max_new_tokens (short/medium/long)
 - Microbatch window (20ms) allows batching within buckets
-- Short requests get priority, avoiding HOL blocking
+- Short requests get priority, reducing head-of-line blocking from long requests
 
 """
     
@@ -1544,19 +1635,25 @@ vLLM's continuous batching is evidenced by:
 """
     
     if profile_results:
+        cuda_ms = profile_results.get('total_cuda_time_ms', 0)
+        cpu_ms = profile_results.get('total_cpu_time_ms', 0)
+        mem_mb = profile_results.get('max_memory_mb', 0)
         report += f"""
-**Profiling Summary:**
+**Profiling Summary (host-process `torch.profiler`):**
 
 | Metric | Value |
 |--------|-------|
-| Total CUDA Time | {profile_results.get('total_cuda_time_ms', 0):.1f} ms |
-| Total CPU Time | {profile_results.get('total_cpu_time_ms', 0):.1f} ms |
-| Max Memory | {profile_results.get('max_memory_mb', 0):.1f} MB |
+| Total CUDA Time | {cuda_ms:.1f} ms |
+| Total CPU Time | {cpu_ms:.1f} ms |
+| Max Memory (PyTorch allocator) | {mem_mb:.1f} MB |
 
-**Bottleneck Breakdown:**
-- Decode phase: ~90% of total time (decode-dominated regime)
-- Prefill phase: ~10% of total time
-- Scheduler overhead: <1%
+**Limitation:** vLLM executes the model in a separate worker process (`EngineCore`),
+so the host-side `torch.profiler` used here does not observe the GPU kernels or
+device memory of that worker — hence CUDA time and max memory above are typically
+0. These numbers therefore reflect only the host/orchestration process, not the
+model's device-side execution. A kernel-level breakdown would require profiling
+inside the vLLM worker (e.g. Nsight Systems or an in-worker profiler hook), which
+is listed under Next Steps.
 
 """
     else:
@@ -1625,8 +1722,8 @@ modal run modal_app.py::generate_report
 See `/results/` directory for:
 - JSONL logs per experiment
 - JSON summaries
-- PNG plots
-- Profiler traces
+- PNG plots (when generated via `generate_plots`)
+- Host-process profiler summary (`profiles/vllm_profile.json`)
 
 """
     
@@ -2712,6 +2809,7 @@ def rebuild_intervention_summary():
         "comparison_issues": [],
         "statistical_analysis": statistical_results,
         "measurement_layer": "scheduler_layer",
+        "arrival_process": "poisson",
         "sample_size": {
             "total": int(baseline_summary.get("num_requests", 0)),
             "short": int(baseline_short_summary.get("num_requests", 0)),
